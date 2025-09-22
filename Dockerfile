@@ -11,13 +11,13 @@ ENV PYTHONUNBUFFERED=1 \
 RUN groupadd --gid 1000 appuser && \
     useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash appuser
 
-# Install system dependencies required by Playwright and the app
+# Install system dependencies required by Playwright, Puppeteer, and the app
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Essential tools
     curl \
     wget \
     ca-certificates \
-    # Playwright browser dependencies
+    gnupg \
+    # Playwright/Puppeteer browser dependencies
     libnss3 \
     libnspr4 \
     libdbus-1-3 \
@@ -35,7 +35,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 \
     libgstreamer1.0-0 \
     libgstreamer-plugins-base1.0-0 \
-    # Clean up
+    # Node.js for Puppeteer
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -49,8 +51,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir playwright
 
-# Install Playwright browsers and dependencies
+# Install Playwright browsers
 RUN playwright install --with-deps chromium
+
+# Install Puppeteer globally and download Chrome
+RUN npm install -g puppeteer && \
+    PUPPETEER_SKIP_DOWNLOAD=false node -e "require('puppeteer').createBrowserFetcher().download('1091')"
 
 # Copy application code
 COPY . .
