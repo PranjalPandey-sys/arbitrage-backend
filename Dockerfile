@@ -45,12 +45,12 @@ WORKDIR /app
 # Copy requirements first for better Docker layer caching
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies (ensure playwright is installed)
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir playwright
 
-# Install Playwright browsers (must be done after pip install playwright)
-RUN playwright install chromium && \
-    playwright install-deps chromium
+# Install Playwright browsers and dependencies
+RUN playwright install --with-deps chromium
 
 # Copy application code
 COPY . .
