@@ -1,7 +1,5 @@
-# Use Python 3.11 slim image for smaller size
 FROM python:3.11-slim-bookworm
 
-# Environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -9,11 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Kolkata \
     DEBIAN_FRONTEND=noninteractive
 
-# Create non-root user
 RUN groupadd --gid 1000 appuser && \
     useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash appuser
 
-# Install system dependencies for Playwright/Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl wget ca-certificates gnupg tzdata \
     fonts-noto fonts-noto-color-emoji fonts-liberation fonts-dejavu-core \
@@ -24,46 +20,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgconf-2-4 libxtst6 libdrm2 libxcursor1 libxi6 \
     && rm -rf /var/lib/apt/lists/* && apt-get clean && apt-get autoremove -y
 
-# Set timezone
 RUN ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Working directory at /app
 WORKDIR /app
 
-# Copy requirements first for caching
 COPY requirements.txt .
-
-# Install Python deps + Playwright
 RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install playwright
+    pip install playwright && \
+    playwright install --with-deps chromium
 
-# Install Playwright browsers with system deps
-RUN playwright install --with-deps chromium
-
-# Copy the entire application code (including app/ and configs)
 COPY . .
 
-# Prepare directories
 RUN mkdir -p logs exports /tmp/chrome-user-data && \
     chown -R appuser:appuser /app /tmp/chrome-user-data && \
     chmod -R 755 /app /tmp/chrome-user-data
 
-# Switch to non-root user
 USER appuser
 
-# Expose port
 EXPOSE ${PORT:-10000}
 
-# Production env vars
 ENV PYTHONPATH=/app \
     HOST=0.0.0.0 \
     PORT=${PORT:-10000} \
     HEADLESS=true \
     PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import requests; requests.get(f'http://localhost:${PORT:-10000}/health', timeout=5)" || exit 1
 
-# Start the application from nested folder
 CMD ["python", "app/engine/arbitrage.py"]
