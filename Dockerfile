@@ -1,66 +1,105 @@
 # Use Python 3.11 slim image for smaller size
 FROM python:3.11-slim-bookworm
 
-# Environment variables
+# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Kolkata \
+    DEBIAN_FRONTEND=noninteractive
 
-# Create non-root user
+# Create non-root user for security
 RUN groupadd --gid 1000 appuser && \
     useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash appuser
 
-# Install system dependencies for Playwright/Puppeteer + Node from NodeSource
+# Install system dependencies required by Playwright/Chromium and the app
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl wget ca-certificates gnupg \
-    libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
-    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libxcb1 libxkbcommon0 \
-    libasound2 libgtk-3-0 libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
- && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
- && apt-get install -y nodejs \
- && rm -rf /var/lib/apt/lists/*
+    # Essential tools
+    curl \
+    wget \
+    ca-certificates \
+    gnupg \
+    tzdata \
+    # Fonts for proper rendering
+    fonts-noto \
+    fonts-noto-color-emoji \
+    fonts-liberation \
+    fonts-dejavu-core \
+    # Chromium/Playwright browser dependencies
+    libnss3 \
+    libnspr4 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libatspi2.0-0 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libxcb1 \
+    libxkbcommon0 \
+    libasound2 \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libgtk-3-0 \
+    libgstreamer1.0-0 \
+    libgstreamer-plugins-base1.0-0 \
+    libxss1 \
+    libgconf-2-4 \
+    libxtst6 \
+    libdrm2 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxi6 \
+    # Clean up
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && apt-get autoremove -y
+
+# Set timezone
+RUN ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for caching
+# Copy requirements first for better Docker layer caching
 COPY requirements.txt .
 
-# Install Python dependencies (ensure playwright is included)
+# Install Python dependencies including Playwright
 RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir playwright
+    pip install playwright
 
-# Install Playwright browsers
+# Install Playwright browsers with system dependencies
 RUN playwright install --with-deps chromium
-
-# Install Puppeteer locally and download Chrome
-RUN npm init -y \
- && npm install puppeteer@21 --progress=false --loglevel=error \
- && node -e "require('puppeteer').createBrowserFetcher().download('1091')"
 
 # Copy application code
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p logs exports && \
-    chown -R appuser:appuser /app
+# Create necessary directories with proper permissions
+RUN mkdir -p logs exports /tmp/chrome-user-data && \
+    chown -R appuser:appuser /app /tmp/chrome-user-data && \
+    chmod -R 755 /app /tmp/chrome-user-data
 
 # Switch to non-root user
 USER appuser
 
-# Expose port
-EXPOSE 10000
+# Expose port (configurable via environment)
+EXPOSE ${PORT:-10000}
 
-# Environment variables for runtime
+# Set production environment variables
 ENV PYTHONPATH=/app \
     HOST=0.0.0.0 \
-    PORT=10000 \
-    HEADLESS=true
+    PORT=${PORT:-10000} \
+    HEADLESS=true \
+    PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:10000/health || exit 1
+# Health check - lightweight check without spawning browsers
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import requests; requests.get(f'http://localhost:${PORT:-10000}/health', timeout=5)" || exit 1
 
 # Start the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
+CMD ["python", "-m", "arbitrage"]
