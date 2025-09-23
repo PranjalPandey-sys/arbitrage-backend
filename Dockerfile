@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set timezone
 RUN ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Working directory
+# Working directory at /app
 WORKDIR /app
 
 # Copy requirements first for caching
@@ -40,7 +40,7 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Install Playwright browsers with system deps
 RUN playwright install --with-deps chromium
 
-# Copy application code
+# Copy the entire application code (including app/ and configs)
 COPY . .
 
 # Prepare directories
@@ -65,5 +65,5 @@ ENV PYTHONPATH=/app \
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import requests; requests.get(f'http://localhost:${PORT:-10000}/health', timeout=5)" || exit 1
 
-# Start the application (fixed to run the script directly)
-CMD ["python", "arbitrage.py"]
+# Start the application from nested folder
+CMD ["python", "app/engine/arbitrage.py"]
