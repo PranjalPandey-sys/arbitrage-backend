@@ -1,9 +1,18 @@
-"""Arbitrage detection and calculation engine."""
+"""Production-ready arbitrage detection and calculation engine with Playwright web scraping."""
 
+import asyncio
+import json
 import math
+import os
+import tempfile
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from decimal import Decimal, ROUND_HALF_UP
+
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from app.schema.models import (
     MatchedEvent, ArbitrageOpportunity, OutcomeData, 
@@ -13,6 +22,289 @@ from app.config import settings
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# FastAPI app for health check endpoint
+app = FastAPI(title="Arbitrage Detection API")
+
+# Global browser instance
+_browser: Optional[Browser] = None
+_context: Optional[BrowserContext] = None
+
+@app.get("/health")
+async def health_check():
+    """Lightweight health check endpoint."""
+    return JSONResponse(
+        content={
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "service": "arbitrage-detection"
+        },
+        status_code=200
+    )
+
+async def init_browser() -> Tuple[Browser, BrowserContext]:
+    """Initialize production-safe Playwright browser."""
+    global _browser, _context
+    
+    if _browser and _context:
+        return _browser, _context
+    
+    try:
+        playwright = await async_playwright().start()
+        
+        # Production-safe Chromium launch arguments
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage", 
+            "--disable-gpu",
+            "--disable-web-security",
+            "--disable-features=VizDisplayCompositor",
+            "--disable-extensions",
+            "--disable-plugins",
+            "--disable-images",  # Faster loading
+            "--disable-javascript-harmony-shipping",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-ipc-flooding-protection",
+            "--user-data-dir=/tmp/chrome-user-data",
+        ]
+        
+        # Optional: disable site isolation for better performance
+        if os.getenv("DISABLE_SITE_ISOLATION", "false").lower() == "true":
+            launch_args.append("--disable-features=site-per-process")
+        
+        # Check if proxy is configured
+        proxy_url = os.getenv("PROXY_URL")
+        proxy_config = None
+        if proxy_url:
+            logger.info(f"Using proxy: {proxy_url}")
+            proxy_config = {"server": proxy_url}
+        
+        _browser = await playwright.chromium.launch(
+            headless=True,
+            args=launch_args,
+            timeout=60000
+        )
+        
+        # Create browser context with production settings
+        context_options = {
+            "viewport": {"width": 1366, "height": 768},
+            "locale": "en-US",
+            "timezone_id": "Asia/Kolkata",
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "extra_http_headers": {
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1"
+            }
+        }
+        
+        if proxy_config:
+            context_options["proxy"] = proxy_config
+        
+        _context = await _browser.new_context(**context_options)
+        
+        # Enable request/response logging
+        async def log_request(request):
+            logger.debug(f"Request: {request.method} {request.url}")
+        
+        async def log_response(response):
+            if response.status >= 400:
+                logger.warning(f"Response: {response.status} {response.url}")
+            else:
+                logger.debug(f"Response: {response.status} {response.url}")
+        
+        _context.on("request", log_request)
+        _context.on("response", log_response)
+        
+        logger.info("Browser initialized successfully")
+        return _browser, _context
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize browser: {e}")
+        raise
+
+
+async def cleanup_browser():
+    """Clean up browser resources."""
+    global _browser, _context
+    
+    try:
+        if _context:
+            await _context.close()
+            _context = None
+        
+        if _browser:
+            await _browser.close()
+            _browser = None
+            
+        logger.info("Browser cleanup completed")
+    except Exception as e:
+        logger.error(f"Error during browser cleanup: {e}")
+
+
+async def scrape_odds_from_page(url: str, target_selector: str, 
+                               extraction_logic: callable,
+                               page_specific_config: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Production-safe odds scraping with comprehensive error handling and debugging.
+    
+    Args:
+        url: Target URL to scrape
+        target_selector: CSS selector to wait for
+        extraction_logic: Function to extract data from page
+        page_specific_config: Additional page-specific configuration
+    
+    Returns:
+        Dictionary containing scraped odds data
+    """
+    browser, context = await init_browser()
+    page = None
+    
+    try:
+        page = await context.new_page()
+        
+        # Set up console message logging
+        async def log_console_message(msg):
+            if msg.type in ['error', 'warning']:
+                logger.warning(f"Console {msg.type}: {msg.text}")
+            else:
+                logger.debug(f"Console {msg.type}: {msg.text}")
+        
+        page.on("console", log_console_message)
+        
+        # Navigate to page with production-safe settings
+        logger.info(f"Navigating to: {url}")
+        
+        await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=45000
+        )
+        
+        # Apply page-specific configuration if provided
+        if page_specific_config:
+            # Handle cookies consent if needed
+            if page_specific_config.get("accept_cookies_selector"):
+                try:
+                    await page.click(page_specific_config["accept_cookies_selector"], timeout=5000)
+                    logger.debug("Accepted cookies")
+                except PlaywrightTimeoutError:
+                    logger.debug("No cookies banner found or already accepted")
+            
+            # Handle any page-specific actions
+            if page_specific_config.get("pre_scrape_actions"):
+                for action in page_specific_config["pre_scrape_actions"]:
+                    try:
+                        if action["type"] == "click":
+                            await page.click(action["selector"], timeout=action.get("timeout", 10000))
+                        elif action["type"] == "wait":
+                            await page.wait_for_timeout(action["duration"])
+                        elif action["type"] == "scroll":
+                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    except Exception as action_error:
+                        logger.warning(f"Pre-scrape action failed: {action_error}")
+        
+        # Wait for target selector to be visible
+        logger.debug(f"Waiting for selector: {target_selector}")
+        
+        try:
+            await page.wait_for_selector(
+                target_selector,
+                state="visible",
+                timeout=60000
+            )
+        except PlaywrightTimeoutError:
+            logger.error(f"Target selector not found: {target_selector}")
+            await debug_page_state(page, "selector_timeout")
+            return {"error": "Target selector not found", "odds": []}
+        
+        # Wait for network to be idle (odds fully loaded)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            logger.warning("Network didn't become idle, proceeding anyway")
+        
+        # Additional wait for dynamic content
+        await page.wait_for_timeout(2000)
+        
+        # Extract odds using provided logic
+        logger.debug("Extracting odds data")
+        odds_data = await extraction_logic(page)
+        
+        # Validate extracted data
+        if not odds_data or (isinstance(odds_data, dict) and not odds_data.get("odds")):
+            logger.warning("No odds data extracted, debugging page state")
+            await debug_page_state(page, "no_odds_data")
+            return {"error": "No odds data found", "odds": []}
+        
+        logger.info(f"Successfully extracted {len(odds_data.get('odds', []))} odds entries")
+        return odds_data
+        
+    except Exception as e:
+        logger.error(f"Error scraping odds from {url}: {e}")
+        if page:
+            await debug_page_state(page, "general_error")
+        return {"error": str(e), "odds": []}
+    
+    finally:
+        if page:
+            try:
+                await page.close()
+            except:
+                pass
+
+
+async def debug_page_state(page: Page, debug_reason: str):
+    """Debug page state when odds extraction fails."""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save page HTML
+        content = await page.content()
+        html_file = f"/tmp/odds_debug_{debug_reason}_{timestamp}.html"
+        
+        with open(html_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+        logger.warning(f"Page HTML saved to: {html_file}")
+        
+        # Take screenshot
+        screenshot_file = f"/tmp/odds_debug_{debug_reason}_{timestamp}.png"
+        await page.screenshot(path=screenshot_file, full_page=True)
+        logger.warning(f"Screenshot saved to: {screenshot_file}")
+        
+        # Log page title and URL
+        title = await page.title()
+        url = page.url
+        logger.warning(f"Debug info - Title: {title}, URL: {url}")
+        
+        # Check for common error indicators
+        error_selectors = [
+            'div[class*="error"]',
+            'div[class*="blocked"]', 
+            'div[class*="captcha"]',
+            'div[class*="bot-protection"]'
+        ]
+        
+        for selector in error_selectors:
+            elements = await page.query_selector_all(selector)
+            if elements:
+                text = await elements[0].text_content()
+                logger.warning(f"Found error element: {selector} - {text}")
+        
+    except Exception as debug_error:
+        logger.error(f"Failed to debug page state: {debug_error}")
 
 
 class ArbitrageEngine:
@@ -442,3 +734,319 @@ class ArbitrageEngine:
         except Exception as e:
             logger.debug(f"Error calculating middle opportunity: {e}")
             return None
+
+
+# Example usage functions for different betting sites
+async def scrape_bet365_odds(url: str) -> Dict[str, Any]:
+    """Example: Scrape odds from Bet365."""
+    
+    async def extract_bet365_odds(page: Page) -> Dict[str, Any]:
+        """Extract odds from Bet365 page."""
+        try:
+            # Wait for odds elements to load
+            await page.wait_for_selector('.gl-Market_General', timeout=30000)
+            
+            odds_data = {
+                "bookmaker": "bet365",
+                "timestamp": datetime.now().isoformat(),
+                "odds": []
+            }
+            
+            # Extract match information
+            match_name = await page.text_content('.rcl-ParticipantFixtureDetails_TeamNames')
+            if match_name:
+                odds_data["match"] = match_name.strip()
+            
+            # Extract odds for main markets
+            market_elements = await page.query_selector_all('.gl-Market_General')
+            
+            for market_element in market_elements:
+                try:
+                    # Get market name
+                    market_header = await market_element.query_selector('.gl-MarketGroupPod_FixtureHeaderLabel')
+                    market_name = await market_header.text_content() if market_header else "Unknown Market"
+                    
+                    # Get outcomes and odds
+                    outcome_elements = await market_element.query_selector_all('.gl-Participant_General')
+                    
+                    for outcome_element in outcome_elements:
+                        outcome_name_elem = await outcome_element.query_selector('.gl-Participant_Name')
+                        odds_elem = await outcome_element.query_selector('.gl-Participant_Odds')
+                        
+                        if outcome_name_elem and odds_elem:
+                            outcome_name = await outcome_name_elem.text_content()
+                            odds_text = await odds_elem.text_content()
+                            
+                            # Convert odds to decimal format
+                            try:
+                                if '/' in odds_text:  # Fractional odds
+                                    parts = odds_text.split('/')
+                                    decimal_odds = (float(parts[0]) / float(parts[1])) + 1.0
+                                else:
+                                    decimal_odds = float(odds_text)
+                                
+                                odds_data["odds"].append({
+                                    "market": market_name.strip(),
+                                    "outcome": outcome_name.strip(),
+                                    "odds": round(decimal_odds, 2),
+                                    "url": page.url
+                                })
+                            except ValueError:
+                                logger.warning(f"Could not parse odds: {odds_text}")
+                
+                except Exception as market_error:
+                    logger.warning(f"Error processing market: {market_error}")
+                    continue
+            
+            return odds_data
+            
+        except Exception as e:
+            logger.error(f"Error extracting Bet365 odds: {e}")
+            return {"bookmaker": "bet365", "odds": [], "error": str(e)}
+    
+    return await scrape_odds_from_page(
+        url=url,
+        target_selector='.gl-Market_General',
+        extraction_logic=extract_bet365_odds,
+        page_specific_config={
+            "accept_cookies_selector": ".ccm-CookieConsentPopup_Accept",
+            "pre_scrape_actions": [
+                {"type": "wait", "duration": 3000},  # Wait for odds to stabilize
+            ]
+        }
+    )
+
+
+async def scrape_pinnacle_odds(url: str) -> Dict[str, Any]:
+    """Example: Scrape odds from Pinnacle."""
+    
+    async def extract_pinnacle_odds(page: Page) -> Dict[str, Any]:
+        """Extract odds from Pinnacle page."""
+        try:
+            # Wait for odds container
+            await page.wait_for_selector('[data-test-id="MarketGrid"]', timeout=30000)
+            
+            odds_data = {
+                "bookmaker": "pinnacle",
+                "timestamp": datetime.now().isoformat(),
+                "odds": []
+            }
+            
+            # Extract event name
+            event_name_elem = await page.query_selector('.event-card-participant-name')
+            if event_name_elem:
+                event_name = await event_name_elem.text_content()
+                odds_data["match"] = event_name.strip()
+            
+            # Extract markets and odds
+            market_grids = await page.query_selector_all('[data-test-id="MarketGrid"]')
+            
+            for market_grid in market_grids:
+                try:
+                    # Get market name
+                    market_name_elem = await market_grid.query_selector('.market-type-name')
+                    market_name = await market_name_elem.text_content() if market_name_elem else "Unknown Market"
+                    
+                    # Get odds buttons
+                    odds_buttons = await market_grid.query_selector_all('[data-test-id="price-button"]')
+                    
+                    for button in odds_buttons:
+                        try:
+                            # Get outcome name
+                            outcome_elem = await button.query_selector('.participant-name')
+                            outcome_name = await outcome_elem.text_content() if outcome_elem else ""
+                            
+                            # Get odds
+                            odds_elem = await button.query_selector('.price')
+                            odds_text = await odds_elem.text_content() if odds_elem else ""
+                            
+                            if outcome_name and odds_text:
+                                try:
+                                    decimal_odds = float(odds_text)
+                                    
+                                    odds_data["odds"].append({
+                                        "market": market_name.strip(),
+                                        "outcome": outcome_name.strip(),
+                                        "odds": round(decimal_odds, 2),
+                                        "url": page.url
+                                    })
+                                except ValueError:
+                                    logger.warning(f"Could not parse Pinnacle odds: {odds_text}")
+                        
+                        except Exception as button_error:
+                            logger.warning(f"Error processing odds button: {button_error}")
+                            continue
+                
+                except Exception as market_error:
+                    logger.warning(f"Error processing Pinnacle market: {market_error}")
+                    continue
+            
+            return odds_data
+            
+        except Exception as e:
+            logger.error(f"Error extracting Pinnacle odds: {e}")
+            return {"bookmaker": "pinnacle", "odds": [], "error": str(e)}
+    
+    return await scrape_odds_from_page(
+        url=url,
+        target_selector='[data-test-id="MarketGrid"]',
+        extraction_logic=extract_pinnacle_odds
+    )
+
+
+async def scrape_generic_sportsbook(url: str, site_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Generic sportsbook scraper with configurable selectors."""
+    
+    async def extract_generic_odds(page: Page) -> Dict[str, Any]:
+        """Extract odds using provided configuration."""
+        try:
+            odds_data = {
+                "bookmaker": site_config.get("name", "unknown"),
+                "timestamp": datetime.now().isoformat(),
+                "odds": []
+            }
+            
+            # Extract match name if configured
+            if site_config.get("match_selector"):
+                match_elem = await page.query_selector(site_config["match_selector"])
+                if match_elem:
+                    match_name = await match_elem.text_content()
+                    odds_data["match"] = match_name.strip()
+            
+            # Extract odds using configured selectors
+            market_selector = site_config.get("market_selector", "")
+            odds_selector = site_config.get("odds_selector", "")
+            
+            if market_selector and odds_selector:
+                market_elements = await page.query_selector_all(market_selector)
+                
+                for market_element in market_elements:
+                    try:
+                        # Get market name
+                        market_name = "Unknown Market"
+                        if site_config.get("market_name_selector"):
+                            market_name_elem = await market_element.query_selector(site_config["market_name_selector"])
+                            if market_name_elem:
+                                market_name = await market_name_elem.text_content()
+                        
+                        # Get odds within this market
+                        odds_elements = await market_element.query_selector_all(odds_selector)
+                        
+                        for odds_element in odds_elements:
+                            try:
+                                # Extract outcome name
+                                outcome_name = ""
+                                if site_config.get("outcome_name_selector"):
+                                    outcome_elem = await odds_element.query_selector(site_config["outcome_name_selector"])
+                                    if outcome_elem:
+                                        outcome_name = await outcome_elem.text_content()
+                                
+                                # Extract odds value
+                                odds_value = ""
+                                if site_config.get("odds_value_selector"):
+                                    odds_elem = await odds_element.query_selector(site_config["odds_value_selector"])
+                                    if odds_elem:
+                                        odds_value = await odds_elem.text_content()
+                                
+                                if outcome_name and odds_value:
+                                    try:
+                                        # Convert to decimal odds based on format
+                                        decimal_odds = float(odds_value)
+                                        
+                                        # Apply odds conversion if needed
+                                        if site_config.get("odds_format") == "american":
+                                            decimal_odds = american_to_decimal(float(odds_value))
+                                        elif site_config.get("odds_format") == "fractional":
+                                            decimal_odds = fractional_to_decimal(odds_value)
+                                        
+                                        odds_data["odds"].append({
+                                            "market": market_name.strip(),
+                                            "outcome": outcome_name.strip(),
+                                            "odds": round(decimal_odds, 2),
+                                            "url": page.url
+                                        })
+                                    except ValueError:
+                                        logger.warning(f"Could not parse odds: {odds_value}")
+                            
+                            except Exception as odds_error:
+                                logger.warning(f"Error processing odds element: {odds_error}")
+                                continue
+                    
+                    except Exception as market_error:
+                        logger.warning(f"Error processing market: {market_error}")
+                        continue
+            
+            return odds_data
+            
+        except Exception as e:
+            logger.error(f"Error extracting generic odds: {e}")
+            return {"bookmaker": site_config.get("name", "unknown"), "odds": [], "error": str(e)}
+    
+    return await scrape_odds_from_page(
+        url=url,
+        target_selector=site_config.get("target_selector", "body"),
+        extraction_logic=extract_generic_odds,
+        page_specific_config=site_config.get("page_config", {})
+    )
+
+
+def american_to_decimal(american_odds: float) -> float:
+    """Convert American odds to decimal odds."""
+    if american_odds > 0:
+        return (american_odds / 100) + 1
+    else:
+        return (100 / abs(american_odds)) + 1
+
+
+def fractional_to_decimal(fractional_odds: str) -> float:
+    """Convert fractional odds to decimal odds."""
+    try:
+        if '/' in fractional_odds:
+            numerator, denominator = fractional_odds.split('/')
+            return (float(numerator) / float(denominator)) + 1
+        else:
+            return float(fractional_odds)
+    except:
+        return 1.0
+
+
+async def main():
+    """Main application entry point."""
+    try:
+        # Initialize browser on startup
+        await init_browser()
+        
+        # Start FastAPI server
+        port = int(os.getenv("PORT", 10000))
+        host = os.getenv("HOST", "0.0.0.0")
+        
+        config = uvicorn.Config(
+            app=app,
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=True
+        )
+        
+        server = uvicorn.Server(config)
+        
+        logger.info(f"Starting arbitrage detection service on {host}:{port}")
+        
+        try:
+            await server.serve()
+        finally:
+            # Clean up browser on shutdown
+            await cleanup_browser()
+    
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal")
+        await cleanup_browser()
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+        await cleanup_browser()
+        raise
+
+
+if __name__ == "__main__":
+    # Run the application
+    asyncio.run(main())
