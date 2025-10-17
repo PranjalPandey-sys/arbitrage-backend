@@ -45,7 +45,8 @@ ENV PYTHONPATH=/app \
     HEADLESS=true \
     PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import requests; requests.get(f'http://localhost:${PORT:-10000}/health', timeout=5)" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl --fail http://localhost:${PORT:-10000}/health || exit 1
 
-CMD ["python", "app/engine/arbitrage.py"]
+# Updated CMD to run the FastAPI application
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1
