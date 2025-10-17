@@ -26,8 +26,13 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install playwright && \
-    playwright install --with-deps chromium
+    pip install playwright
+
+# Set the Playwright browsers path and install browsers in the correct location
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
+RUN mkdir -p /home/appuser/.cache/ms-playwright && \
+    chown -R appuser:appuser /home/appuser/.cache && \
+    su appuser -c "playwright install --with-deps chromium"
 
 COPY . .
 
