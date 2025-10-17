@@ -5,7 +5,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=Asia/Kolkata \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
 
 RUN groupadd --gid 1000 appuser && \
     useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash appuser
@@ -31,9 +32,9 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY . .
 
-RUN mkdir -p logs exports /tmp/chrome-user-data && \
-    chown -R appuser:appuser /app /tmp/chrome-user-data && \
-    chmod -R 755 /app /tmp/chrome-user-data
+RUN mkdir -p logs exports /tmp/chrome-user-data "$PLAYWRIGHT_BROWSERS_PATH" && \
+    chown -R appuser:appuser /app /tmp/chrome-user-data "$PLAYWRIGHT_BROWSERS_PATH" && \
+    chmod -R 755 /app /tmp/chrome-user-data "$PLAYWRIGHT_BROWSERS_PATH"
 
 USER appuser
 
@@ -42,8 +43,7 @@ EXPOSE ${PORT:-10000}
 ENV PYTHONPATH=/app \
     HOST=0.0.0.0 \
     PORT=${PORT:-10000} \
-    HEADLESS=true \
-    PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
+    HEADLESS=true
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl --fail http://localhost:${PORT:-10000}/health || exit 1
