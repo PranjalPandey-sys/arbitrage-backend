@@ -13,6 +13,7 @@ from datetime import datetime
 from app.api.routes import router
 from app.config import settings
 from app.utils.logging import get_logger, setup_logging
+from app.service.orchestrator import cleanup_playwright_instance
 
 # Setup logging
 setup_logging()
@@ -21,24 +22,23 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
     logger.info("Starting arbitrage detection backend...")
     try:
-        from playwright.async_api import async_playwright
-        playwright = await async_playwright().start()
-        app.state.playwright = playwright
-        logger.info("Playwright initialized")
+        # Playwright will be initialized on first use in orchestrator
         logger.info("System startup completed successfully")
+        yield
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise
-    yield
-    logger.info("Shutting down arbitrage detection backend...")
-    try:
-        if hasattr(app.state, 'playwright'):
-            await app.state.playwright.stop()
+    finally:
+        logger.info("Shutting down arbitrage detection backend...")
+        try:
+            # Clean up Playwright
+            await cleanup_playwright_instance()
             logger.info("Playwright cleanup completed")
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+        except Exception as e:
+            logger.error(f"Shutdown error: {e}")
 
 
 app = FastAPI(
@@ -65,17 +65,26 @@ app.include_router(router, tags=["arbitrage"])
 
 @app.get("/")
 async def root():
+    """Root endpoint."""
     return {
         "service": "Arbitrage Detection API",
         "version": "1.0.0",
         "status": "operational",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "endpoints": {
+            "health": "/health",
+            "docs": "/docs",
+            "arbitrages": "/api/arbs"
+        }
     }
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
+    """Global exception handler."""
     logger.error(f"Unhandled exception on {request.url}: {exc}")
+    import traceback
+    logger.error(traceback.format_exc())
     return JSONResponse(
         status_code=500,
         content={
@@ -88,11 +97,12 @@ async def global_exception_handler(request, exc):
 
 @app.middleware("http")
 async def logging_middleware(request, call_next):
+    """Request logging middleware."""
     start_time = datetime.now()
     response = await call_next(request)
     process_time = (datetime.now() - start_time).total_seconds()
     logger.info(
-        f"{request.method} {request.url} - "
+        f"{request.method} {request.url.path} - "
         f"Status: {response.status_code} - "
         f"Time: {process_time:.3f}s"
     )
