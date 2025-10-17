@@ -1,20 +1,17 @@
 """Main orchestrator service for coordinating scraping, matching, and arbitrage detection."""
 
 import asyncio
+import os
 import time
 import csv
+import traceback
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Playwright
 
 from app.books.mostbet import MostbetScraper
 from app.books.stake import StakeScraper
-# from app.books.leon import LeonScraper
-# from app.books.parimatch import ParimatchScraper
-# from app.books.onexbet import OnexbetScraper
-# from app.books.onewin import OnewinScraper
 from app.match.matcher import EventMatcher
 from app.engine.arbitrage import ArbitrageEngine
 from app.schema.models import (
@@ -25,6 +22,33 @@ from app.config import settings
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Global Playwright instance
+_playwright_instance: Optional[Playwright] = None
+
+
+async def get_playwright_instance() -> Playwright:
+    """Get or create global Playwright instance."""
+    global _playwright_instance
+    
+    if _playwright_instance is None:
+        _playwright_instance = await async_playwright().start()
+        logger.info("Global Playwright instance initialized")
+    
+    return _playwright_instance
+
+
+async def cleanup_playwright_instance():
+    """Clean up global Playwright instance."""
+    global _playwright_instance
+    
+    if _playwright_instance:
+        try:
+            await _playwright_instance.stop()
+            _playwright_instance = None
+            logger.info("Global Playwright instance cleaned up")
+        except Exception as e:
+            logger.error(f"Error cleaning up Playwright: {e}")
 
 
 class ArbitrageOrchestrator:
@@ -47,18 +71,14 @@ class ArbitrageOrchestrator:
             logger.info("Initialized Mostbet scraper")
         except Exception as e:
             logger.error(f"Failed to initialize Mostbet scraper: {e}")
+            logger.error(traceback.format_exc())
         
         try:
             scrapers[BookmakerName.STAKE] = StakeScraper()
             logger.info("Initialized Stake scraper")
         except Exception as e:
             logger.error(f"Failed to initialize Stake scraper: {e}")
-        
-        # TODO: Initialize other scrapers when implemented
-        # scrapers[BookmakerName.LEON] = LeonScraper()
-        # scrapers[BookmakerName.PARIMATCH] = ParimatchScraper()
-        # scrapers[BookmakerName.ONEXBET] = OnexbetScraper()
-        # scrapers[BookmakerName.ONEWIN] = OnewinScraper()
+            logger.error(traceback.format_exc())
         
         logger.info(f"Initialized {len(scrapers)} scrapers: {list(scrapers.keys())}")
         return scrapers
@@ -69,6 +89,9 @@ class ArbitrageOrchestrator:
         logger.info("Starting full arbitrage detection process")
         
         try:
+            # Ensure Playwright is initialized
+            await get_playwright_instance()
+            
             # Step 1: Scrape all bookmakers
             scraping_results, all_odds = await self._scrape_all_bookmakers(filters)
             
@@ -124,6 +147,7 @@ class ArbitrageOrchestrator:
         except Exception as e:
             processing_time = time.time() - start_time
             logger.error(f"Error in arbitrage detection process: {e}")
+            logger.error(traceback.format_exc())
             
             return ArbitrageResponse(
                 arbitrages=[],
@@ -170,6 +194,7 @@ class ArbitrageOrchestrator:
             
             if isinstance(result, Exception):
                 logger.error(f"Scraper {scraper_name} failed with exception: {result}")
+                logger.error(traceback.format_exc())
                 scraping_results.append(ScrapingResult(
                     bookmaker=scraper_name,
                     success=False,
@@ -189,37 +214,103 @@ class ArbitrageOrchestrator:
         start_time = time.time()
         
         try:
-            # Initialize browser for scraper
-            async with async_playwright() as playwright:
-                await scraper.initialize_browser(playwright)
-                
-                # Scrape odds
-                odds_data = await scraper.scrape_all_odds()
-                
-                # Calculate metrics
-                duration = time.time() - start_time
-                events_count = len(set(odds.event_name for odds in odds_data))
-                
-                # Cleanup
-                await scraper.cleanup()
-                
-                return ScrapingResult(
-                    bookmaker=bookmaker_name,
-                    success=True,
-                    odds_count=len(odds_data),
-                    events_count=events_count,
-                    scrape_duration=duration
-                ), odds_data
+            # Get global Playwright instance
+            playwright = await get_playwright_instance()
+            
+            # Get user data directory from env or use default
+            user_data_dir = os.getenv("PLAYWRIGHT_USER_DATA_DIR", "/tmp/chrome-user-data")
+            os.makedirs(user_data_dir, exist_ok=True)
+            
+            # Create subdirectory for this bookmaker
+            bookmaker_data_dir = os.path.join(user_data_dir, bookmaker_name.value)
+            os.makedirs(bookmaker_data_dir, exist_ok=True)
+            
+            # Launch args (WITHOUT --user-data-dir)
+            launch_args = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--disable-web-security",
+                "--disable-features=VizDisplayCompositor",
+                "--disable-extensions",
+                "--disable-plugins",
+                "--disable-images",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            
+            # Check headless mode
+            headless = os.getenv("HEADLESS", "true").lower() == "true"
+            
+            # Check if proxy is configured
+            proxy_config = None
+            proxy_url = os.getenv("PROXY_URL")
+            if proxy_url:
+                logger.info(f"{bookmaker_name}: Using proxy: {proxy_url}")
+                proxy_config = {"server": proxy_url}
+            
+            # Launch persistent context (this is the correct way for Render)
+            context_options = {
+                "viewport": {"width": 1366, "height": 768},
+                "locale": "en-US",
+                "timezone_id": "Asia/Kolkata",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "extra_http_headers": {
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                },
+                "args": launch_args,
+                "headless": headless
+            }
+            
+            if proxy_config:
+                context_options["proxy"] = proxy_config
+            
+            # Use launch_persistent_context instead of launch + new_context
+            browser_context = await playwright.chromium.launch_persistent_context(
+                user_data_dir=bookmaker_data_dir,
+                **context_options
+            )
+            
+            # Get the first page (persistent context always has one)
+            if browser_context.pages:
+                scraper.page = browser_context.pages[0]
+            else:
+                scraper.page = await browser_context.new_page()
+            
+            scraper.context = browser_context
+            scraper.browser = None  # Not used in persistent context
+            
+            logger.info(f"{bookmaker_name}: Browser context initialized (persistent)")
+            
+            # Scrape odds
+            odds_data = await scraper.scrape_all_odds()
+            
+            # Calculate metrics
+            duration = time.time() - start_time
+            events_count = len(set(odds.event_name for odds in odds_data))
+            
+            # Cleanup
+            try:
+                await browser_context.close()
+                logger.info(f"{bookmaker_name}: Browser context closed")
+            except Exception as cleanup_error:
+                logger.warning(f"{bookmaker_name}: Error closing context: {cleanup_error}")
+            
+            return ScrapingResult(
+                bookmaker=bookmaker_name,
+                success=True,
+                odds_count=len(odds_data),
+                events_count=events_count,
+                scrape_duration=duration
+            ), odds_data
                 
         except Exception as e:
             duration = time.time() - start_time
             logger.error(f"Error scraping {bookmaker_name}: {e}")
+            logger.error(traceback.format_exc())
             
-            try:
-                await scraper.cleanup()
-            except:
-                pass  # Ignore cleanup errors
-                
             return ScrapingResult(
                 bookmaker=bookmaker_name,
                 success=False,
@@ -246,7 +337,7 @@ class ArbitrageOrchestrator:
         
         response = ArbitrageResponse(
             arbitrages=filtered_arbitrages,
-            scraping_results=[],  # Not available for cached results
+            scraping_results=[],
             summary={
                 "cached_result": True,
                 "cache_age_seconds": int(cache_age.total_seconds()),
@@ -293,8 +384,7 @@ class ArbitrageOrchestrator:
             
             # Apply live filter
             if filters.live_only is not None:
-                # Determine if arbitrage is live based on outcomes freshness
-                is_live = arb.freshness_score > 0.8  # Simplified live detection
+                is_live = arb.freshness_score > 0.8
                 if filters.live_only != is_live:
                     continue
             
@@ -308,7 +398,6 @@ class ArbitrageOrchestrator:
             if filters.bankroll and filters.bankroll != arb.bankroll:
                 arb.bankroll = filters.bankroll
                 arb.guaranteed_profit = filters.bankroll * (arb.profit_percentage / 100)
-                # Recalculate stakes (simplified)
                 total_inverse = sum(1.0 / outcome.odds for outcome in arb.outcomes)
                 for i, outcome in enumerate(arb.outcomes):
                     if i < len(arb.stakes):
@@ -358,7 +447,7 @@ class ArbitrageOrchestrator:
                     
                     # Add outcome details
                     for i, (outcome, stake) in enumerate(zip(arb.outcomes, arb.stakes), 1):
-                        if i <= 3:  # Support up to 3 outcomes
+                        if i <= 3:
                             row[f'outcome_{i}_name'] = outcome.name
                             row[f'outcome_{i}_odds'] = outcome.odds
                             row[f'outcome_{i}_bookmaker'] = outcome.bookmaker.value
@@ -370,6 +459,7 @@ class ArbitrageOrchestrator:
             
         except Exception as e:
             logger.error(f"Failed to export arbitrages to CSV: {e}")
+            logger.error(traceback.format_exc())
     
     async def _save_raw_odds_data(self, odds_data: List[RawOddsData]) -> None:
         """Save raw odds data for auditing."""
@@ -410,6 +500,7 @@ class ArbitrageOrchestrator:
             
         except Exception as e:
             logger.error(f"Failed to save raw odds data: {e}")
+            logger.error(traceback.format_exc())
     
     async def get_system_status(self) -> Dict:
         """Get system status information."""
@@ -417,7 +508,7 @@ class ArbitrageOrchestrator:
             "scrapers": {},
             "last_scrape_time": self.last_scrape_time.isoformat() if self.last_scrape_time else None,
             "cached_arbitrages_count": len(self.cached_arbitrages),
-            "system_uptime": time.time(),  # Simplified
+            "system_uptime": time.time(),
             "configuration": {
                 "fuzzy_threshold": settings.fuzzy_threshold,
                 "min_arb_percentage": settings.min_arb_percentage,
@@ -455,27 +546,34 @@ class ArbitrageOrchestrator:
         start_time = time.time()
         
         try:
-            # Simple connection test - try to navigate to main page
-            async with async_playwright() as playwright:
-                await scraper.initialize_browser(playwright)
-                
-                if await scraper.navigate_with_retry(scraper.base_url):
-                    response_time = time.time() - start_time
-                    await scraper.cleanup()
-                    
-                    return {
-                        "bookmaker": bookmaker.value,
-                        "available": True,
-                        "response_time_seconds": round(response_time, 2),
-                        "base_url": scraper.base_url
-                    }
-                else:
-                    await scraper.cleanup()
-                    return {
-                        "bookmaker": bookmaker.value,
-                        "available": False,
-                        "error": "Failed to navigate to site"
-                    }
+            playwright = await get_playwright_instance()
+            
+            user_data_dir = os.getenv("PLAYWRIGHT_USER_DATA_DIR", "/tmp/chrome-user-data")
+            test_dir = os.path.join(user_data_dir, f"test_{bookmaker.value}")
+            os.makedirs(test_dir, exist_ok=True)
+            
+            context = await playwright.chromium.launch_persistent_context(
+                user_data_dir=test_dir,
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            
+            if context.pages:
+                page = context.pages[0]
+            else:
+                page = await context.new_page()
+            
+            await page.goto(scraper.base_url, timeout=30000)
+            
+            response_time = time.time() - start_time
+            await context.close()
+            
+            return {
+                "bookmaker": bookmaker.value,
+                "available": True,
+                "response_time_seconds": round(response_time, 2),
+                "base_url": scraper.base_url
+            }
         
         except Exception as e:
             return {
@@ -483,4 +581,4 @@ class ArbitrageOrchestrator:
                 "available": False,
                 "error": str(e),
                 "response_time_seconds": time.time() - start_time
-            }
+    }
