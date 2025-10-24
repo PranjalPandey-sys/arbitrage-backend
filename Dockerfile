@@ -1,4 +1,4 @@
-# Use Playwright official image (includes browsers + deps)
+# Use Playwright official image
 FROM mcr.microsoft.com/playwright/python:latest
 
 WORKDIR /app
@@ -7,14 +7,17 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Kolkata \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Install python deps
+# Install dependencies
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy code
 COPY . /app
 
-# Run as provided non-root user (pwuser exists in this base image)
+# Give write permission for logs and other runtime files
+RUN chmod -R 777 /app
+
+# Run as non-root user
 USER pwuser
 
 EXPOSE 10000
