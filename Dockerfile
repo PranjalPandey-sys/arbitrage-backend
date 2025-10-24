@@ -1,26 +1,37 @@
-# Use Playwright base image
-FROM mcr.microsoft.com/playwright/python:latest
+FROM python:3.11-slim
 
 WORKDIR /app
 
-ENV PYTHONUNBUFFERED=1 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
     TZ=Asia/Kolkata \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Install Python dependencies
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Install system dependencies required for Chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget curl gnupg ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+    libc6 libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 libx11-6 \
+    libxcomposite1 libxdamage1 libxrandr2 libxss1 libxshmfence1 libpangocairo-1.0-0 \
+    libpango-1.0-0 lsb-release xdg-utils && \
+    rm -rf /var/lib/apt/lists/*
 
-#  Explicitly install browsers (ensure they exist in /ms-playwright)
+# Install Python dependencies and Playwright
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt && \
+    pip install --no-cache-dir playwright
+
+# Install Chromium browsers inside the image
 RUN python -m playwright install --with-deps chromium
 
-# Copy your code
+# Copy project files
 COPY . /app
 
-# Fix permissions for logging etc.
+# Give write permission to app files
 RUN chmod -R 777 /app
 
-USER pwuser
+# Create and use non-root user
+RUN useradd -m appuser
+USER appuser
 
 EXPOSE 10000
 
