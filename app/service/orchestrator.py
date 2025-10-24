@@ -212,25 +212,22 @@ class ArbitrageOrchestrator:
     async def _scrape_single_bookmaker(self, bookmaker_name: BookmakerName, scraper) -> tuple[ScrapingResult, List[RawOddsData]]:
         """Scrape a single bookmaker with proper error handling."""
         start_time = time.time()
+        browser = None
+        context = None
         
         try:
             # Get global Playwright instance
             playwright = await get_playwright_instance()
             
-            # Get user data directory from env or use default
-            user_data_dir = os.getenv("PLAYWRIGHT_USER_DATA_DIR", "/tmp/chrome-user-data")
-            os.makedirs(user_data_dir, exist_ok=True)
+            # Check headless mode
+            headless = os.getenv("HEADLESS", "true").lower() == "true"
             
-            # Create subdirectory for this bookmaker
-            bookmaker_data_dir = os.path.join(user_data_dir, bookmaker_name.value)
-            os.makedirs(bookmaker_data_dir, exist_ok=True)
-            
-            # Launch args (WITHOUT --user-data-dir)
+            # Launch args optimized for Render
             launch_args = [
                 "--no-sandbox",
+                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-setuid-sandbox",
                 "--disable-web-security",
                 "--disable-features=VizDisplayCompositor",
                 "--disable-extensions",
@@ -238,10 +235,9 @@ class ArbitrageOrchestrator:
                 "--disable-images",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
             ]
-            
-            # Check headless mode
-            headless = os.getenv("HEADLESS", "true").lower() == "true"
             
             # Check if proxy is configured
             proxy_config = None
@@ -250,7 +246,15 @@ class ArbitrageOrchestrator:
                 logger.info(f"{bookmaker_name}: Using proxy: {proxy_url}")
                 proxy_config = {"server": proxy_url}
             
-            # Launch persistent context (this is the correct way for Render)
+            # Launch browser (simple launch, not persistent)
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                args=launch_args
+            )
+            
+            logger.info(f"{bookmaker_name}: Browser launched successfully")
+            
+            # Create context
             context_options = {
                 "viewport": {"width": 1366, "height": 768},
                 "locale": "en-US",
@@ -260,32 +264,24 @@ class ArbitrageOrchestrator:
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 },
-                "args": launch_args,
-                "headless": headless
             }
             
             if proxy_config:
                 context_options["proxy"] = proxy_config
             
-            # Use launch_persistent_context instead of launch + new_context
-            browser_context = await playwright.chromium.launch_persistent_context(
-                user_data_dir=bookmaker_data_dir,
-                **context_options
-            )
+            context = await browser.new_context(**context_options)
+            scraper.context = context
             
-            # Get the first page (persistent context always has one)
-            if browser_context.pages:
-                scraper.page = browser_context.pages[0]
-            else:
-                scraper.page = await browser_context.new_page()
+            # Create page
+            scraper.page = await context.new_page()
+            scraper.browser = browser
             
-            scraper.context = browser_context
-            scraper.browser = None  # Not used in persistent context
-            
-            logger.info(f"{bookmaker_name}: Browser context initialized (persistent)")
+            logger.info(f"{bookmaker_name}: Browser context and page initialized")
             
             # Scrape odds
+            logger.info(f"{bookmaker_name}: Starting odds scraping...")
             odds_data = await scraper.scrape_all_odds()
+            logger.info(f"{bookmaker_name}: Scraping completed, collected {len(odds_data)} odds")
             
             # Calculate metrics
             duration = time.time() - start_time
@@ -293,10 +289,15 @@ class ArbitrageOrchestrator:
             
             # Cleanup
             try:
-                await browser_context.close()
-                logger.info(f"{bookmaker_name}: Browser context closed")
+                if scraper.page and not scraper.page.is_closed():
+                    await scraper.page.close()
+                if context:
+                    await context.close()
+                if browser:
+                    await browser.close()
+                logger.info(f"{bookmaker_name}: Browser cleanup completed")
             except Exception as cleanup_error:
-                logger.warning(f"{bookmaker_name}: Error closing context: {cleanup_error}")
+                logger.warning(f"{bookmaker_name}: Error during cleanup: {cleanup_error}")
             
             return ScrapingResult(
                 bookmaker=bookmaker_name,
@@ -310,6 +311,17 @@ class ArbitrageOrchestrator:
             duration = time.time() - start_time
             logger.error(f"Error scraping {bookmaker_name}: {e}")
             logger.error(traceback.format_exc())
+            
+            # Cleanup on error
+            try:
+                if scraper.page and not scraper.page.is_closed():
+                    await scraper.page.close()
+                if context:
+                    await context.close()
+                if browser:
+                    await browser.close()
+            except Exception:
+                pass
             
             return ScrapingResult(
                 bookmaker=bookmaker_name,
@@ -544,29 +556,27 @@ class ArbitrageOrchestrator:
         
         scraper = self.scrapers[bookmaker]
         start_time = time.time()
+        browser = None
+        context = None
         
         try:
             playwright = await get_playwright_instance()
             
-            user_data_dir = os.getenv("PLAYWRIGHT_USER_DATA_DIR", "/tmp/chrome-user-data")
-            test_dir = os.path.join(user_data_dir, f"test_{bookmaker.value}")
-            os.makedirs(test_dir, exist_ok=True)
-            
-            context = await playwright.chromium.launch_persistent_context(
-                user_data_dir=test_dir,
+            browser = await playwright.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
             
-            if context.pages:
-                page = context.pages[0]
-            else:
-                page = await context.new_page()
+            context = await browser.new_context()
+            page = await context.new_page()
             
             await page.goto(scraper.base_url, timeout=30000)
             
             response_time = time.time() - start_time
+            
+            await page.close()
             await context.close()
+            await browser.close()
             
             return {
                 "bookmaker": bookmaker.value,
@@ -576,9 +586,11 @@ class ArbitrageOrchestrator:
             }
         
         except Exception as e:
+            if browser:
+                await browser.close()
             return {
                 "bookmaker": bookmaker.value,
                 "available": False,
                 "error": str(e),
                 "response_time_seconds": time.time() - start_time
-    }
+        }
