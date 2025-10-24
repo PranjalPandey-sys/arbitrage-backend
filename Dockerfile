@@ -1,4 +1,4 @@
-# Use Playwright official image
+# Use Playwright base image
 FROM mcr.microsoft.com/playwright/python:latest
 
 WORKDIR /app
@@ -7,17 +7,19 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Kolkata \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Install dependencies
+# Install Python dependencies
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy code
+#  Explicitly install browsers (ensure they exist in /ms-playwright)
+RUN python -m playwright install --with-deps chromium
+
+# Copy your code
 COPY . /app
 
-# Give write permission for logs and other runtime files
+# Fix permissions for logging etc.
 RUN chmod -R 777 /app
 
-# Run as non-root user
 USER pwuser
 
 EXPOSE 10000
