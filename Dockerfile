@@ -25,9 +25,18 @@ RUN ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install playwright && \
-    playwright install --with-deps chromium
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install playwright and browsers as appuser to avoid permission issues
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+# Install playwright browsers in user directory
+RUN playwright install --with-deps chromium
+
+# Switch back to root to copy files and set permissions
+USER root
 
 COPY . .
 
@@ -48,5 +57,4 @@ ENV PYTHONPATH=/app \
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl --fail http://localhost:${PORT:-10000}/health || exit 1
 
-# Updated CMD to run the FastAPI application
 CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1
