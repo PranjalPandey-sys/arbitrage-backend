@@ -1,24 +1,20 @@
-# --- Use official Playwright image with browsers preinstalled ---
-FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+# Use the latest Playwright base image that matches the Python package
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
+# Set working directory
 WORKDIR /app
 
-ENV PYTHONUNBUFFERED=1 \
-    TZ=Asia/Kolkata \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# Copy requirements and install dependencies
+COPY requirements.txt .
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
 
-# --- Install Python and your app dependencies ---
-COPY requirements.txt /app/requirements.txt
-RUN apt-get update && apt-get install -y python3 python3-pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+# Copy all project files
+COPY . .
 
-# --- Copy project code and fix permissions ---
-COPY . /app
-RUN chmod -R 777 /app
-
-# --- Run as non-root user ---
-USER pwuser
-
+# Expose the port Render expects
+ENV PORT=10000
 EXPOSE 10000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Start the app
+CMD ["python", "app/main.py"]
