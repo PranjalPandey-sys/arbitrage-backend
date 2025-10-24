@@ -1,20 +1,30 @@
-# Use the latest Playwright base image that matches the Python package
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+# Final recommended Dockerfile for Render (robust + Playwright browsers present)
+# Uses Playwright's maintained Python image which includes the native browser runtimes.
+FROM mcr.microsoft.com/playwright/python:latest
 
-# Set working directory
+# Working dir where the repo will be copied
 WORKDIR /app
 
-# Copy requirements and install dependencies
-COPY requirements.txt .
+# Ensure the base image uses the same browswer cache path
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Kolkata \
+    PORT=10000
+
+# Install application dependencies (cache with Docker layers)
+COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy all project files
-COPY . .
+# Copy project files
+COPY . /app
 
-# Expose the port Render expects
-ENV PORT=10000
+# Ensure runtime user can write logs and temp files
+RUN chmod -R 777 /app
+
+# Run as the non-root pwuser included in the Playwright image
+USER pwuser
+
+# Use the module entrypoint so Python resolves the 'app' package consistently
 EXPOSE 10000
-
-# Start the app
-CMD ["python", "app/main.py"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000"]
