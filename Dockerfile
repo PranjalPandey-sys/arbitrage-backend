@@ -1,21 +1,24 @@
-# Use Playwright 1.40.0 base image
+# Use the correct Playwright image compatible with v1.40.0
 FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
-# Set workdir to project root
+# Set working directory to project root
 WORKDIR /code
 
-# Copy everything
+# Copy project files
 COPY . .
 
-# Install dependencies
+# Upgrade pip and install dependencies
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-# Ensure browsers are installed
-RUN playwright install --with-deps
+# Install Playwright dependencies and browsers
+RUN playwright install --with-deps chromium
 
 # Expose FastAPI port
 EXPOSE 8000
 
-# Start FastAPI from inside the app folder
+# Set PYTHONPATH to include /code
+ENV PYTHONPATH=/code
+
+# Run app
 CMD ["python", "app/main.py"]
