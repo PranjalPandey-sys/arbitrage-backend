@@ -101,6 +101,10 @@ arbitrages_*.csv
 config.json
 secrets.json
 
+# IMPORTANT: Credentials file (contains API keys)
+config/credentials.yaml
+credentials.yaml
+
 # Scraped data
 scraped_data/
 data/
