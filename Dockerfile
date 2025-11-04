@@ -7,6 +7,10 @@ WORKDIR /code
 # Copy project files
 COPY . .
 
+# Make Python output unbuffered (helps with container logs)
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/code
+
 # Upgrade pip and install dependencies
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
@@ -17,8 +21,5 @@ RUN playwright install --with-deps chromium
 # Expose FastAPI port
 EXPOSE 8000
 
-# Set PYTHONPATH to include /code
-ENV PYTHONPATH=/code
-
-# Run app
-CMD ["python", "app/main.py"]
+# Run app with Uvicorn so it binds to all interfaces in container
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
